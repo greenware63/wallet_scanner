@@ -1,0 +1,31 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE settings
+.idea/
+.vscode/
+
+# Log and temporary files
+*.log
+scan_stats.txt
+scan_tron_stats.txt
+tron_cache.json
+btc_cache.json
+
+found_wallets.txt
+found_tron_wallets.txt
+proxies.txt
+user_agents.txt
+*.tmp
+
+# Operating System files
+.DS_Store
+Thumbs.db

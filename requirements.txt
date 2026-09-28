@@ -1,0 +1,5 @@
+bit>=0.8.0
+tronpy>=0.6.2
+curl_cffi>=0.16.0
+base58>=2.1.1
+coincurve>=21.0.0

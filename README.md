@@ -1,6 +1,6 @@
 # Wallet Scanner 🔐
 
-**High-performance async cryptocurrency address scanner** for Bitcoin and TRON blockchains with advanced features like proxy rotation, TLS fingerprinting, multi-API support, and intelligent caching.
+**High-performance async cryptocurrency address scanner** for Bitcoin, TRON, and Solana with proxy rotation, TLS fingerprinting, multi-API/RPC support, and intelligent caching.
 
 > ⚠️ **Educational Purpose Only**: This project is designed for learning and research. Ensure compliance with applicable laws and terms of service of blockchain APIs.
 
@@ -18,14 +18,29 @@
 - 💾 **Statistics tracking** and result logging
 
 ### TRON Scanner (`tron_scanner.py`)
-- 🚀 **Async I/O** for concurrent address checking
+- 🚀 **Async I/O** with `curl_cffi` for concurrent address checking
 - 💰 **Dual balance checking**: TRX + USDT (TRC-20)
-- 🌐 **Multi-API support** with fallback and health checks
+- 🌐 **Multi-API support** (TronGrid, TronScan, P2P) with fallback and health checks
 - 🔑 **TronGrid API Key support** (optional, for higher rate limits)
+- ⏭️ **Skip USDT** for accounts that do not exist on-chain (native mode)
+- 🔀 **Optional JSON-RPC batch mode** (`eth_getBalance` + `eth_call`) for monitoring workloads
+- 🔒 **Connection pool cap** via `asyncio.Semaphore`
 - 📦 **Result caching** to prevent duplicate requests
 - 🔄 **Proxy rotation** support
 - ⚡ **Worker Pool** (6 concurrent workers)
 - 🎯 **Token Bucket Rate Limiter** per provider
+- 📊 **Performance statistics** and logging
+
+### Solana Scanner (`solana_scanner.py`)
+- 🚀 **Async I/O** with `curl_cffi` for TLS/JA3 fingerprint spoofing
+- 💰 **Dual balance checking**: SOL + USDC (SPL)
+- 🌐 **Multi-RPC** with fallback and health checks
+- 🔀 **Batch JSON-RPC mode** (`getBalance` + `getTokenAccountsByOwner` in one round-trip)
+- 🔒 **Connection pool cap** via `asyncio.Semaphore`
+- 📦 **LRU cache** with disk persistence
+- 🔄 **Proxy rotation** and User-Agent rotation
+- ⚡ **Worker Pool** (6 concurrent workers)
+- 🎯 **Token Bucket Rate Limiter** per RPC provider
 - 📊 **Performance statistics** and logging
 
 ---
@@ -62,16 +77,12 @@ pip install -r requirements.txt
 ```
 
 **Dependencies:**
-- `bit>=0.8.0` - Bitcoin address utilities
-- `tronpy>=0.6.2` - TRON blockchain library
-- `curl_cffi>=0.16.0` - Async HTTP with TLS spoofing
-- `base58>=2.1.1` - Base58 encoding/decoding
-- `coincurve>=18.0.0` - Elliptic curve cryptography
-- `certifi` - CA certificates
-- `pycryptodome` - Cryptographic primitives
-- `eth-abi>=5.0.0` - Ethereum ABI encoding (for TRON EVM)
-- `httpx` - Modern HTTP client
-- `requests` - HTTP library
+- `bit>=0.8.0` — Bitcoin address utilities
+- `tronpy>=0.6.2` — TRON key/address helpers
+- `curl_cffi>=0.16.0` — Async HTTP with TLS spoofing
+- `base58>=2.1.1` — Base58 encoding/decoding (Solana keys)
+- `coincurve>=21.0.0` — Elliptic curve cryptography
+- `solders>=0.21.0` — Solana keypair generation
 
 ---
 
@@ -89,13 +100,13 @@ CACHE_TTL = 3600               # Cache TTL in seconds (1 hour)
 ```
 
 **Output Files:**
-- `found_wallets.txt` - Found addresses with balances
-- `scan_stats.txt` - Scan statistics
-- `btc_cache.json` - Cache data
+- `found_wallets.txt` — Found addresses with balances
+- `scan_stats.txt` — Scan statistics
+- `btc_cache.json` — Cache data
 
 **Input Files (Optional):**
-- `proxies.txt` - Proxy list (one per line)
-- `user_agents.txt` - Custom User-Agent list (one per line)
+- `proxies.txt` — Proxy list (one per line)
+- `user_agents.txt` — Custom User-Agent list (one per line)
 
 ### TRON Scanner Configuration
 Edit the configuration section in `tron_scanner.py`:
@@ -104,21 +115,55 @@ Edit the configuration section in `tron_scanner.py`:
 NUM_WORKERS = 6                # Number of concurrent workers
 REQUEST_TIMEOUT = 15           # Request timeout in seconds
 MAX_RETRIES_PER_PROVIDER = 2   # Max retries per API
+USE_JSONRPC_BATCH = False      # False = native + skip-empty; True = batch JSON-RPC
+MAX_CONCURRENT_REQUESTS = 32   # Cap on concurrent outbound HTTP requests
 TRONGRID_API_KEY = ""          # Get from https://www.trongrid.io/
 CACHE_MAX_SIZE = 50_000        # Maximum cache entries
 CACHE_TTL = 3600               # Cache TTL in seconds (1 hour)
-USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"  # USDT contract
-USDT_DECIMALS = 6              # USDT decimal places
+USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+USDT_DECIMALS = 6
 ```
 
 **Output Files:**
-- `found_tron_wallets.txt` - Found addresses with balances
-- `scan_tron_stats.txt` - Scan statistics
-- `tron_cache.json` - Cache data
+- `found_tron_wallets.txt` — Found addresses with balances
+- `scan_tron_stats.txt` — Scan statistics
+- `tron_cache.json` — Cache data
 
 **Input Files (Optional):**
-- `proxies.txt` - Proxy list (one per line)
-- `user_agents.txt` - Custom User-Agent list (one per line)
+- `proxies.txt` — Proxy list (one per line)
+- `user_agents.txt` — Custom User-Agent list (one per line)
+
+### Solana Scanner Configuration
+Edit the configuration section in `solana_scanner.py`:
+
+```python
+NUM_WORKERS = 6                # Number of concurrent workers
+REQUEST_TIMEOUT = 15           # Request timeout in seconds
+MAX_RETRIES_PER_PROVIDER = 2   # Max retries per RPC
+USE_BATCH_RPC = True           # One JSON-RPC batch per address (recommended)
+MAX_CONCURRENT_REQUESTS = 32   # Cap on concurrent outbound HTTP requests
+CACHE_MAX_SIZE = 50_000        # Maximum cache entries
+CACHE_TTL = 3600               # Cache TTL in seconds (1 hour)
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+USDC_DECIMALS = 6
+
+# Prefer your own Helius / QuickNode / Triton endpoint for real use
+SOLANA_RPC_ENDPOINTS = [
+    "https://api.mainnet-beta.solana.com",
+    "https://solana-api.projectserum.com",
+    "https://rpc.ankr.com/solana",
+    "https://solana.public-rpc.com",
+]
+```
+
+**Output Files:**
+- `found_solana_wallets.txt` — Found addresses with balances
+- `scan_solana_stats.txt` — Scan statistics
+- `solana_cache.json` — Cache data
+
+**Input Files (Optional):**
+- `proxies.txt` — Proxy list (one per line)
+- `user_agents.txt` — Custom User-Agent list (one per line)
 
 ---
 
@@ -132,24 +177,21 @@ USDT_DECIMALS = 6              # USDT decimal places
 # Linux/Mac
 source venv/bin/activate
 
-# Run the scanner
 python bit_scanner.py
 ```
 
 ### Run TRON Scanner
 ```bash
-# Activate virtual environment first
-# Windows
-.\venv\Scripts\Activate.ps1
-# Linux/Mac
-source venv/bin/activate
-
-# Run the scanner
 python tron_scanner.py
 ```
 
+### Run Solana Scanner
+```bash
+python solana_scanner.py
+```
+
 ### Stop Gracefully
-Press `Ctrl+C` to stop either scanner. The application will:
+Press `Ctrl+C` to stop any scanner. The application will:
 1. Signal all workers to stop
 2. Cancel pending tasks
 3. Save cache to disk
@@ -171,15 +213,13 @@ socks5://proxy3:port
 The scanner will automatically rotate through available proxies.
 
 ### Custom User-Agents
-Create a `user_agents.txt` file with one User-Agent per line. The scanner will randomly select from this list to appear more like a regular browser.
+Create a `user_agents.txt` file with one User-Agent per line. The scanner will cycle through this list.
 
 ### TLS Fingerprinting
-Both scanners use `curl_cffi` with `impersonate` mode to spoof browser TLS fingerprints:
+All scanners use `curl_cffi` with `impersonate` mode to spoof browser TLS fingerprints:
 - Chrome versions: 124, 123, 120, 116, 110
 - Edge: 101
 - Safari: 17.0, 15.5
-
-This helps avoid detection and rate limiting by blockchain APIs.
 
 ### Caching
 - **LRU Cache**: In-memory cache with configurable size limit
@@ -187,10 +227,17 @@ This helps avoid detection and rate limiting by blockchain APIs.
 - **TTL (Time-To-Live)**: Cached entries expire after the configured TTL
 
 ### Rate Limiting
-Each API provider has its own Token Bucket rate limiter to:
+Each API/RPC provider has its own Token Bucket rate limiter to:
 - Avoid overwhelming APIs
 - Respect rate limit quotas
 - Distribute load evenly
+
+### Connection Pool Control
+TRON and Solana scanners use `asyncio.Semaphore` (`MAX_CONCURRENT_REQUESTS`) to cap concurrent outbound HTTP requests independently of worker count.
+
+### Batch JSON-RPC
+- **TRON**: set `USE_JSONRPC_BATCH = True` for one batch request per address (better for monitoring known addresses). Keep `False` for random scanning so empty accounts can skip the USDT call.
+- **Solana**: `USE_BATCH_RPC = True` by default; public RPCs are heavily rate-limited, so batching halves round-trips.
 
 ---
 
@@ -211,6 +258,13 @@ Found wallet: TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t
   USDT Balance: 5000.123456
 ```
 
+### Solana Scanner Output
+```
+Found wallet: 7EqQdEULxWcraVx3mXKFjc84LhQk8BNAR...
+  SOL Balance: 1.250000000 SOL
+  USDC Balance: 100.500000 USDC
+```
+
 ---
 
 ## File Structure
@@ -218,6 +272,7 @@ Found wallet: TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t
 wallet_scanner/
 ├── bit_scanner.py              # Bitcoin address scanner
 ├── tron_scanner.py             # TRON address scanner
+├── solana_scanner.py           # Solana address scanner
 ├── requirements.txt            # Python dependencies
 ├── README.md                   # This file
 ├── .gitignore                  # Git ignore rules
@@ -226,10 +281,13 @@ wallet_scanner/
 ├── user_agents.txt             # User-Agent list (optional)
 ├── found_wallets.txt           # Found BTC addresses (generated)
 ├── found_tron_wallets.txt      # Found TRON addresses (generated)
+├── found_solana_wallets.txt    # Found Solana addresses (generated)
 ├── scan_stats.txt              # Bitcoin scan statistics (generated)
 ├── scan_tron_stats.txt         # TRON scan statistics (generated)
+├── scan_solana_stats.txt       # Solana scan statistics (generated)
 ├── btc_cache.json              # Bitcoin cache (generated)
-└── tron_cache.json             # TRON cache (generated)
+├── tron_cache.json             # TRON cache (generated)
+└── solana_cache.json           # Solana cache (generated)
 ```
 
 ---
@@ -237,17 +295,19 @@ wallet_scanner/
 ## Performance Considerations
 
 - **Worker Count**: Increase `NUM_WORKERS` for faster scanning (requires more system resources)
+- **Concurrent Requests**: Tune `MAX_CONCURRENT_REQUESTS` on TRON/Solana to match your network and RPC limits
 - **Request Timeout**: Lower timeout for faster failure detection, higher for unreliable networks
 - **Cache Size**: Larger cache reduces API calls but uses more memory
-- **Proxy Rotation**: Can significantly slow down scanning but reduces detection risk
+- **Proxy Rotation**: Can slow scanning but reduces detection risk
 - **Rate Limiting**: Strict rate limits prevent bans but reduce throughput
+- **Solana RPCs**: Public endpoints are aggressively rate-limited; use a private RPC for serious use
 
 ---
 
 ## Troubleshooting
 
 ### `ModuleNotFoundError`
-Ensure virtual environment is activated and all dependencies are installed:
+Ensure the virtual environment is activated and dependencies are installed:
 ```bash
 pip install -r requirements.txt
 ```
@@ -256,6 +316,7 @@ pip install -r requirements.txt
 - Reduce `NUM_WORKERS` to lower request rate
 - Add proxies via `proxies.txt`
 - For TRON: Add `TRONGRID_API_KEY` for higher limits
+- For Solana: Replace public RPCs with a private endpoint (Helius, QuickNode, Triton, etc.)
 
 ### Proxy Errors
 - Verify proxy list format (one per line)
@@ -267,6 +328,7 @@ pip install -r requirements.txt
 - Increase `NUM_WORKERS`
 - Reduce `REQUEST_TIMEOUT`
 - Verify proxy quality
+- On Solana, ensure batch mode is enabled and RPCs are healthy
 
 ---
 
@@ -318,13 +380,18 @@ Created for educational blockchain research and development.
 ## Support
 
 For issues, questions, or suggestions:
-- Open an GitHub Issue
+- Open a GitHub Issue
 - Check existing documentation
-- Review code comments (includes Farsi documentation)
+- Review code comments (TRON scanner includes Farsi documentation)
 
 ---
 
 ## Changelog
+
+### Version 1.1.0
+- Added Solana scanner (`solana_scanner.py`) with SOL + USDC support
+- TRON: skip USDT for non-existent accounts, optional JSON-RPC batch mode, connection semaphore
+- Updated dependencies (`solders`)
 
 ### Version 1.0.0
 - Initial release

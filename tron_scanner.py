@@ -8,6 +8,11 @@ TRON Address Scanner (Educational)
 - چرخش پروکسی
 - Worker Pool با asyncio
 - Rate limiter Token Bucket برای هر Provider
+
+بهینه‌سازی‌های اعمال‌شده:
+  1) Skip درخواست USDT برای اکانت‌های ناموجود روی زنجیره
+  2) حالت batch JSON-RPC (eth_getBalance + eth_call) برای مانیتورینگ
+  3) asyncio.Semaphore برای کنترل سقف اتصال‌های همزمان curl_cffi
 """
 import asyncio
 import sys
@@ -29,10 +34,22 @@ NUM_WORKERS = 6
 REQUEST_TIMEOUT = 15
 MAX_RETRIES_PER_PROVIDER = 2
 
+# بهینه‌سازی ۲ — حالت batch JSON-RPC:
+#   False → API نیتیو ترون + skip-empty (بهترین برای اسکن تصادفی)
+#   True  → یک درخواست batch دو متدی per address (بهترین برای مانیتورینگ)
+USE_JSONRPC_BATCH = False
+
+# بهینه‌سازی ۳ — سقف اتصال‌های همزمان curl_cffi
+MAX_CONCURRENT_REQUESTS = 32
+
 TRONGRID_API_KEY = ""   # از https://www.trongrid.io/ بگیر
 
 USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
 USDT_DECIMALS = 6
+
+# eth_getBalance روی TronGrid مقدار را بر حسب SUN برمی‌گرداند.
+# اگر provider شما wei (۱۸ رقم اعشار) برگرداند، به 10**18 تغییر دهید.
+ETH_BALANCE_UNIT = 1_000_000
 
 FOUND_FILE = Path("found_tron_wallets.txt")
 STATS_FILE = Path("scan_tron_stats.txt")
@@ -89,6 +106,7 @@ class BalanceCache:
     کش LRU با TTL برای نتایج موجودی.
     از time.time() استفاده می‌شود تا بین ری‌استارت/ریبوت هم TTL معتبر بماند.
     """
+
     def __init__(self, max_size=50_000, ttl=3600):
         self.max_size = max_size
         self.ttl = ttl
@@ -187,20 +205,47 @@ class TronAPIProvider:
 
 
 # ---- Provider 1: TronGrid ----
+_USDT_CONTRACT_HEX_CACHE = None
+
+
+def _usdt_contract_hex() -> str:
+    """0x + 40 hex بدون پیشوند 41"""
+    global _USDT_CONTRACT_HEX_CACHE
+    if _USDT_CONTRACT_HEX_CACHE is None:
+        _USDT_CONTRACT_HEX_CACHE = "0x" + to_hex_address(USDT_CONTRACT)[2:]
+    return _USDT_CONTRACT_HEX_CACHE
+
+
+def _tron_to_evm_hex(address: str) -> str:
+    """Base58 TRON → 0x-prefixed 20-byte hex"""
+    return "0x" + to_hex_address(address)[2:]
+
+
 class TronGridProvider(TronAPIProvider):
+    BALANCE_OF_SELECTOR = "70a08231"  # keccak256("balanceOf(address)")[:4]
+
     def __init__(self):
         super().__init__("trongrid", rate=6.0)
         self.base_url = "https://api.trongrid.io"
-        self._api_key = TRONGRID_API_KEY
-        self._extra_headers = {}
-        if self._api_key:
-            self._extra_headers["TRON-PRO-API-KEY"] = self._api_key
+        self.jsonrpc_url = f"{self.base_url}/jsonrpc"
+        self.use_batch = USE_JSONRPC_BATCH
+        self._extra_headers = {"Content-Type": "application/json"}
+        if TRONGRID_API_KEY:
+            self._extra_headers["TRON-PRO-API-KEY"] = TRONGRID_API_KEY
+
+    # ---------- Request builders ----------
 
     def build_requests(self, address):
+        if self.use_batch:
+            return self._build_batch(address)
+        return self._build_native(address)
+
+    def _build_native(self, address):
+        """حالت پیش‌فرض: دو درخواست جدا، با قابلیت skip."""
         trx_url = f"{self.base_url}/wallet/getaccount"
         trx_body = {"address": address, "visible": True}
 
-        addr_hex = self._to_eth_style_hex(address)
+        addr_hex = to_hex_address(address)[2:]
         param = addr_hex.rjust(64, "0")
         usdt_url = f"{self.base_url}/wallet/triggerconstantcontract"
         usdt_body = {
@@ -210,26 +255,41 @@ class TronGridProvider(TronAPIProvider):
             "parameter": param,
             "visible": True,
         }
-
         return [
             (trx_url, "POST", trx_body, "trx"),
             (usdt_url, "POST", usdt_body, "usdt"),
         ]
 
+    def _build_batch(self, address):
+        """حالت batch: یک POST با آرایه‌ی دو متد JSON-RPC 2.0."""
+        evm = _tron_to_evm_hex(address)
+        trx_req = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_getBalance",
+            "params": [evm, "latest"],
+        }
+        call_data = "0x" + self.BALANCE_OF_SELECTOR + evm[2:].rjust(64, "0")
+        usdt_req = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "eth_call",
+            "params": [
+                {"to": _usdt_contract_hex(), "data": call_data},
+                "latest",
+            ],
+        }
+        return [(self.jsonrpc_url, "POST", [trx_req, usdt_req], "batch")]
+
     def headers(self):
         return self._extra_headers
 
-    @staticmethod
-    def _to_eth_style_hex(address: str) -> str:
-        try:
-            hex_addr = to_hex_address(address)  # '41...'
-            return hex_addr[2:]
-        except Exception:
-            return ""
+    # ---------- Native parsers ----------
 
     @staticmethod
     def parse_trx(data, address, provider_name):
-        if not data or "balance" not in data:
+        # wallet/getaccount برای اکانت ناموجود {} برمی‌گرداند
+        if not data:
             return {
                 "address": address, "total_sun": 0, "total_trx": 0.0,
                 "tx_count": 0, "provider": provider_name, "active": False,
@@ -239,7 +299,8 @@ class TronGridProvider(TronAPIProvider):
             "address": address, "total_sun": balance_sun,
             "total_trx": balance_sun / 1_000_000,
             "tx_count": data.get("transactions", 0) or 0,
-            "provider": provider_name, "active": True,
+            "provider": provider_name,
+            "active": True,  # اکانت روی زنجیره وجود دارد
         }
 
     @staticmethod
@@ -254,6 +315,53 @@ class TronGridProvider(TronAPIProvider):
             return {"usdt_sun": raw, "usdt": raw / (10 ** USDT_DECIMALS)}
         except Exception:
             return {"usdt_sun": 0, "usdt": 0.0}
+
+    # ---------- JSON-RPC parsers ----------
+
+    @staticmethod
+    def parse_eth_balance(hex_result, address, provider_name):
+        if hex_result is None:
+            return None
+        try:
+            sun = int(hex_result, 16) if isinstance(hex_result, str) else int(hex_result)
+        except Exception:
+            return None
+        return {
+            "address": address, "total_sun": sun,
+            "total_trx": sun / ETH_BALANCE_UNIT,
+            "tx_count": 0,
+            "provider": provider_name,
+            # eth_getBalance وجود اکانت را نشان نمی‌دهد؛ فقط موجودی.
+            "active": sun > 0,
+        }
+
+    @staticmethod
+    def parse_eth_call(hex_result, address, provider_name):
+        if hex_result is None:
+            return {"usdt_sun": 0, "usdt": 0.0}
+        try:
+            raw = int(hex_result, 16) if isinstance(hex_result, str) else int(hex_result)
+            return {"usdt_sun": raw, "usdt": raw / (10 ** USDT_DECIMALS)}
+        except Exception:
+            return {"usdt_sun": 0, "usdt": 0.0}
+
+    @classmethod
+    def parse_batch(cls, data, address, provider_name):
+        """پاسخ آرایه‌ای JSON-RPC batch → (trx_result, usdt_result)"""
+        if not isinstance(data, list):
+            return None, None
+        trx_result = None
+        usdt_result = None
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            rid = item.get("id")
+            result = item.get("result")
+            if rid == 1:
+                trx_result = cls.parse_eth_balance(result, address, provider_name)
+            elif rid == 2:
+                usdt_result = cls.parse_eth_call(result, address, provider_name)
+        return trx_result, usdt_result
 
 
 # ---- Provider 2: TronScan ----
@@ -426,12 +534,14 @@ def build_headers(ua: str, extra: dict | None = None) -> dict:
 # ==================== Balance Checker ====================
 class BalanceChecker:
     def __init__(self, providers, proxy_pool: ProxyPool, ua_mgr: UAManager,
-                 cache: BalanceCache):
+                 cache: BalanceCache, max_concurrent: int = MAX_CONCURRENT_REQUESTS):
         self.providers = providers
         self.proxy_pool = proxy_pool
         self.ua_mgr = ua_mgr
         self.cache = cache
         self.session: AsyncSession | None = None
+        # بهینه‌سازی ۳: سقف اتصال‌های همزمان
+        self._sem = asyncio.Semaphore(max_concurrent)
 
     async def __aenter__(self):
         self.session = AsyncSession()
@@ -442,22 +552,23 @@ class BalanceChecker:
             await self.session.close()
 
     async def _request(self, provider, url, method, body):
-        """یک درخواست شبکه‌ای با rate limiting + proxies + impersonate"""
-        await provider.rate_limiter.acquire()
-        headers = build_headers(self.ua_mgr.next(), provider.headers())
-        proxies = await self.proxy_pool.get()
-        impersonate = random.choice(IMPERSONATE_TARGETS)
+        """یک درخواست شبکه‌ای با Semaphore + rate limiting + proxies + impersonate"""
+        async with self._sem:
+            await provider.rate_limiter.acquire()
+            headers = build_headers(self.ua_mgr.next(), provider.headers())
+            proxies = await self.proxy_pool.get()
+            impersonate = random.choice(IMPERSONATE_TARGETS)
 
-        kwargs = {
-            "headers": headers,
-            "proxies": proxies,
-            "timeout": REQUEST_TIMEOUT,
-            "impersonate": impersonate,
-        }
-        if method == "POST" and body is not None:
-            kwargs["json"] = body
+            kwargs = {
+                "headers": headers,
+                "proxies": proxies,
+                "timeout": REQUEST_TIMEOUT,
+                "impersonate": impersonate,
+            }
+            if method == "POST" and body is not None:
+                kwargs["json"] = body
 
-        return await self.session.request(method, url, **kwargs)
+            return await self.session.request(method, url, **kwargs)
 
     async def check(self, address: str):
         """
@@ -491,6 +602,14 @@ class BalanceChecker:
                 if kind == "usdt" and usdt_result is not None:
                     continue
 
+                # بهینه‌سازی ۱: اگر اکانت روی زنجیره وجود ندارد،
+                # درخواست USDT را کاملاً حذف کن.
+                if (kind == "usdt"
+                        and trx_result is not None
+                        and not trx_result.get("active")):
+                    usdt_result = {"usdt_sun": 0, "usdt": 0.0}
+                    continue
+
                 try:
                     api_call_made = True
                     r = await self._request(provider, url, method, body)
@@ -508,6 +627,17 @@ class BalanceChecker:
                         data = r.json()
                     except Exception:
                         data = None
+
+                    # بهینه‌سازی ۲: پاسخ batch را جدا پارس کن
+                    if kind == "batch":
+                        b_trx, b_usdt = provider.parse_batch(
+                            data, address, provider.name
+                        )
+                        if b_trx is not None:
+                            trx_result = b_trx
+                        if b_usdt is not None:
+                            usdt_result = b_usdt
+                        continue
 
                     if kind in ("trx", "both"):
                         trx_result = provider.parse_trx(data, address, provider.name)
@@ -718,6 +848,11 @@ async def main():
     print("  اسکنر ترون — async + curl_cffi + USDT + Cache")
     print("  ویژگی‌ها: TRX + USDT | TLS Fingerprint | Multi-API | Proxy | Cache")
     print(f"  تعداد APIها: 3 | Workerها: {NUM_WORKERS}")
+    if USE_JSONRPC_BATCH:
+        print("  🔀 حالت batch JSON-RPC فعال (مناسب مانیتورینگ)")
+    else:
+        print("  ⚡ حالت native + skip-empty فعال (مناسب اسکن)")
+    print(f"  سقف اتصال همزمان: {MAX_CONCURRENT_REQUESTS}")
     if TRONGRID_API_KEY:
         print("  ✅ TronGrid API Key فعال")
     else:
@@ -739,7 +874,10 @@ async def main():
     _install_signal_handlers(loop, stop_event)
 
     try:
-        async with BalanceChecker(providers, proxy_pool, ua_mgr, cache) as checker:
+        async with BalanceChecker(
+            providers, proxy_pool, ua_mgr, cache,
+            max_concurrent=MAX_CONCURRENT_REQUESTS,
+        ) as checker:
             tasks = [
                 asyncio.create_task(
                     worker(i, checker, stats, stop_event, print_lock),

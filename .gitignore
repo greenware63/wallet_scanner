@@ -13,6 +13,11 @@ env/
 .idea/
 .vscode/
 
+# Environment variables / secrets
+.env
+.env.*
+!.env.example
+
 # Log and temporary files
 *.log
 scan_stats.txt

@@ -83,6 +83,25 @@ pip install -r requirements.txt
 - `base58>=2.1.1` — Base58 encoding/decoding (Solana keys)
 - `coincurve>=21.0.0` — Elliptic curve cryptography
 - `solders>=0.21.0` — Solana keypair generation
+- `python-dotenv>=1.0.0` — *(optional)* loads API keys from a local `.env` file; falls back to OS environment variables if not installed
+
+### 4. Configure API Keys (Optional)
+The TRON and Solana scanners can use private API keys/RPCs for higher rate limits. Keys are **never** hardcoded in the source — they are read from environment variables, optionally via a local `.env` file.
+
+```bash
+# Copy the example file and fill in the values you need
+cp .env.example .env
+```
+
+```ini
+# .env
+TRONGRID_API_KEY=your-trongrid-key-here
+HELIUS_API_KEY=your-helius-key-here
+QUICKNODE_SOLANA_URL=
+TRITON_RPC_URL=
+```
+
+> ⚠️ `.env` is git-ignored and must **never** be committed. Only `.env.example` (with empty placeholder values) is tracked in the repository.
 
 ---
 
@@ -93,10 +112,17 @@ Edit the configuration section in `bit_scanner.py`:
 
 ```python
 NUM_WORKERS = 8                # Number of concurrent workers
-REQUEST_TIMEOUT = 12           # Request timeout in seconds
-MAX_RETRIES_PER_PROVIDER = 2   # Max retries per API
+REQUEST_TIMEOUT = 6            # Request timeout in seconds
+MAX_RETRIES_PER_PROVIDER = 1   # Max retries per API (fail-fast)
+ENABLE_CACHE = False           # False for random scanning, True for monitoring fixed addresses
+MAX_CONCURRENT_REQUESTS = 32   # Cap on concurrent outbound HTTP requests
 CACHE_MAX_SIZE = 50_000        # Maximum cache entries
 CACHE_TTL = 3600               # Cache TTL in seconds (1 hour)
+CHECK_ADDRESS_TYPES = (
+    "Native SegWit (P2WPKH)",  # Uncomment more types below to also check them
+    # "Legacy (P2PKH)",
+    # "Nested SegWit (P2SH-P2WPKH)",
+)
 ```
 
 **Output Files:**
@@ -117,12 +143,14 @@ REQUEST_TIMEOUT = 15           # Request timeout in seconds
 MAX_RETRIES_PER_PROVIDER = 2   # Max retries per API
 USE_JSONRPC_BATCH = False      # False = native + skip-empty; True = batch JSON-RPC
 MAX_CONCURRENT_REQUESTS = 32   # Cap on concurrent outbound HTTP requests
-TRONGRID_API_KEY = ""          # Get from https://www.trongrid.io/
+ENABLE_CACHE = False           # False for random scanning, True for monitoring fixed addresses
 CACHE_MAX_SIZE = 50_000        # Maximum cache entries
 CACHE_TTL = 3600               # Cache TTL in seconds (1 hour)
 USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
 USDT_DECIMALS = 6
 ```
+
+`TRONGRID_API_KEY` is **not** a hardcoded constant — it is read at runtime from the `TRONGRID_API_KEY` environment variable (or `.env` file, see [Configure API Keys](#4-configure-api-keys-optional)). Get a free key from https://www.trongrid.io/.
 
 **Output Files:**
 - `found_tron_wallets.txt` — Found addresses with balances
@@ -138,23 +166,17 @@ Edit the configuration section in `solana_scanner.py`:
 
 ```python
 NUM_WORKERS = 6                # Number of concurrent workers
-REQUEST_TIMEOUT = 15           # Request timeout in seconds
-MAX_RETRIES_PER_PROVIDER = 2   # Max retries per RPC
+REQUEST_TIMEOUT = 12           # Request timeout in seconds
+MAX_RETRIES_PER_PROVIDER = 1   # Max retries per RPC (fail-fast)
 USE_BATCH_RPC = True           # One JSON-RPC batch per address (recommended)
 MAX_CONCURRENT_REQUESTS = 32   # Cap on concurrent outbound HTTP requests
 CACHE_MAX_SIZE = 50_000        # Maximum cache entries
 CACHE_TTL = 3600               # Cache TTL in seconds (1 hour)
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 USDC_DECIMALS = 6
-
-# Prefer your own Helius / QuickNode / Triton endpoint for real use
-SOLANA_RPC_ENDPOINTS = [
-    "https://api.mainnet-beta.solana.com",
-    "https://solana-api.projectserum.com",
-    "https://rpc.ankr.com/solana",
-    "https://solana.public-rpc.com",
-]
 ```
+
+`SOLANA_RPC_ENDPOINTS` is built dynamically at startup: if `HELIUS_API_KEY`, `QUICKNODE_SOLANA_URL`, or `TRITON_RPC_URL` are set (via environment variable or `.env`, see [Configure API Keys](#4-configure-api-keys-optional)), those private endpoints are added first; the public `https://api.mainnet-beta.solana.com` endpoint is always appended as a fallback. No API key is ever hardcoded in the source.
 
 **Output Files:**
 - `found_solana_wallets.txt` — Found addresses with balances
@@ -276,6 +298,8 @@ wallet_scanner/
 ├── requirements.txt            # Python dependencies
 ├── README.md                   # This file
 ├── .gitignore                  # Git ignore rules
+├── .env.example                # Template for API key configuration (safe to commit)
+├── .env                        # Your local API keys (git-ignored, never committed)
 ├── venv/                       # Virtual environment (created on install)
 ├── proxies.txt                 # Proxy list (optional)
 ├── user_agents.txt             # User-Agent list (optional)
@@ -315,8 +339,8 @@ pip install -r requirements.txt
 ### API Rate Limiting
 - Reduce `NUM_WORKERS` to lower request rate
 - Add proxies via `proxies.txt`
-- For TRON: Add `TRONGRID_API_KEY` for higher limits
-- For Solana: Replace public RPCs with a private endpoint (Helius, QuickNode, Triton, etc.)
+- For TRON: Set `TRONGRID_API_KEY` in your `.env` file (or environment) for higher limits
+- For Solana: Set `HELIUS_API_KEY` / `QUICKNODE_SOLANA_URL` / `TRITON_RPC_URL` in `.env` to use a private RPC instead of the public endpoint
 
 ### Proxy Errors
 - Verify proxy list format (one per line)
@@ -346,11 +370,12 @@ The authors assume no liability for misuse. Always use responsibly and ethically
 
 ## Security Notes
 
-- ⚠️ **Never hardcode API keys** in the source code
-- ⚠️ Use environment variables or `.env` files for sensitive data
+- ⚠️ **Never hardcode API keys** in the source code — both scanners read keys exclusively from environment variables / `.env`
+- ⚠️ Use environment variables or `.env` files for sensitive data; copy `.env.example` to `.env` and never commit the real `.env` (it is already listed in `.gitignore`)
 - ⚠️ Keep `proxies.txt` and results private
 - ⚠️ Be cautious with rate limiting to avoid IP bans
 - ⚠️ Respect blockchain network resources
+- ⚠️ If a secret is ever committed by mistake, rotate/revoke it immediately and remove it from git history (e.g. `git filter-repo` or BFG Repo-Cleaner) before pushing
 
 ---
 
@@ -382,11 +407,17 @@ Created for educational blockchain research and development.
 For issues, questions, or suggestions:
 - Open a GitHub Issue
 - Check existing documentation
-- Review code comments (TRON scanner includes Farsi documentation)
+- Review code comments (scanners include Farsi documentation)
 
 ---
 
 ## Changelog
+
+### Version 1.2.0
+- Hardened secret handling: API keys are read exclusively from environment variables / `.env` (never hardcoded or committed)
+- Added `.env.example` template and `python-dotenv` as an optional dependency
+- Expanded `.gitignore` to exclude `.env` and local secret files
+- Performance/reliability tuning across all three scanners (AIMD rate limiting, fail-fast retries, connection semaphores)
 
 ### Version 1.1.0
 - Added Solana scanner (`solana_scanner.py`) with SOL + USDC support

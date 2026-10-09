@@ -1,11 +1,27 @@
 """
 Bitcoin Address Scanner (Educational)
 - Async I/O با curl_cffi (جعل TLS/JA3 fingerprint مرورگر)
-- چند API سالم و پرسرعت (mempool.space, blockstream.info, mempool.ninja, mempool.emzy.de, bitaps)
-- سیستم کش دو سطحی LRU با قابلیت ذخیره روی دیسک
+- چند API سالم و پرسرعت
+- سیستم کش دو سطحی LRU با قابلیت ذخیره روی دیسک (قابل خاموش کردن)
 - چرخش پروکسی و User-Agent
-- Worker Pool با asyncio و خاموشی امن (Graceful Shutdown) در ویندوز و لینوکس
-- Rate limiter Token Bucket برای هر Provider
+- Worker Pool با asyncio و خاموشی امن (Graceful Shutdown)
+- Rate limiter Token Bucket تطبیقی (AIMD) برای هر Provider
+
+اصلاحات نسخه‌ی جدید:
+  - افزودن providerهای جدید: blockchain.info, blockchair, btc.com, blockcypher
+  - per-provider timeout (providerهای بلاک‌شده سریع‌تر fail می‌شوند)
+  - لاگ کامل خطا + mark_failure با reason + exponential backoff
+  - CHECK_ADDRESS_TYPES (پیش‌فرض فقط Native SegWit = 3x سرعت)
+  - Worker وقتی همه‌ی providerها disabled هستند می‌خوابد
+
+اصلاحات این نسخه:
+  ۱) AIMD روی RateLimiter (back_off / speed_up) — نرخ در 429 کاهش می‌یابد، نه disable
+  ۲) mark_rate_limited جدا از mark_failure — 429 دیگر provider را disable نمی‌کند
+  ۳) تشخیص خطای API در بدنه JSON — خطاهای HTTP 200 با بدنه‌ی error دیگر
+     به‌عنوان موجودی صفر تفسیر نمی‌شوند
+  ۴) ENABLE_CACHE — برای اسکن تصادفی کلید خاموش کنید
+  ۵) یک session به ازای هر پروکسی — Connection Pooling و HTTP/2 حفظ می‌شود
+  ۶) asyncio.Semaphore برای کنترل سقف اتصال‌های همزمان
 """
 import asyncio
 import sys
@@ -27,8 +43,22 @@ from bit.format import ripemd160_sha256
 # ==================== تنظیمات ====================
 HRP = "bc"
 NUM_WORKERS = 8
-REQUEST_TIMEOUT = 12
-MAX_RETRIES_PER_PROVIDER = 2
+REQUEST_TIMEOUT = 6
+MAX_RETRIES_PER_PROVIDER = 1
+
+# سوئیچ کش:
+#   False → برای اسکن تصادفی کلید (احتمال برخورد تقریباً صفر است)
+#   True  → برای مانیتورینگ لیست ثابتی از آدرس‌ها
+ENABLE_CACHE = False
+
+# سقف اتصال‌های همزمان curl_cffi
+MAX_CONCURRENT_REQUESTS = 32
+
+CHECK_ADDRESS_TYPES = (
+    "Native SegWit (P2WPKH)",
+    # "Legacy (P2PKH)",
+    # "Nested SegWit (P2SH-P2WPKH)",
+)
 
 FOUND_FILE = Path("found_wallets.txt")
 STATS_FILE = Path("scan_stats.txt")
@@ -54,11 +84,23 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
         pass
 
 
-# ==================== Rate Limiter (Token Bucket) ====================
+# ==================== Rate Limiter (AIMD) ====================
 class RateLimiter:
-    """محدودکننده‌ی نرخ async با الگوریتم token bucket"""
-    def __init__(self, rate_per_sec: float, burst: int = 3):
+    """
+    Token bucket با AIMD:
+      - back_off() : کاهش ضربی روی 429
+      - speed_up() : افزایش تدریجی روی موفقیت
+    """
+
+    def __init__(self, rate_per_sec: float, burst: int = 3,
+                 min_rate: float | None = None):
+        self.initial_rate = rate_per_sec
         self.rate = rate_per_sec
+        self.min_rate = (
+            min_rate if min_rate is not None
+            else max(0.05, rate_per_sec * 0.05)
+        )
+        self.initial_capacity = burst
         self.capacity = burst
         self.tokens = float(burst)
         self.last = time.monotonic()
@@ -79,15 +121,38 @@ class RateLimiter:
                 wait = (1.0 - self.tokens) / self.rate
             await asyncio.sleep(wait)
 
+    async def back_off(self, label: str = ""):
+        async with self.lock:
+            old_rate = self.rate
+            old_burst = self.capacity
+            self.rate = max(self.min_rate, self.rate * 0.5)
+            self.capacity = max(1, self.capacity // 2)
+            self.tokens = 0.0
+            if old_rate != self.rate or old_burst != self.capacity:
+                tag = f"[{label}] " if label else ""
+                print(
+                    f"    ↳ {tag}rate {old_rate:.2f}→{self.rate:.2f} req/s, "
+                    f"burst {old_burst}→{self.capacity}"
+                )
+
+    async def speed_up(self):
+        async with self.lock:
+            if self.rate < self.initial_rate:
+                self.rate = min(self.initial_rate, self.rate * 1.05)
+            if self.capacity < self.initial_capacity:
+                self.capacity = min(self.initial_capacity, self.capacity + 1)
+
 
 # ==================== Cache ====================
 class BalanceCache:
     """
-    کش LRU با TTL برای نتایج موجودی آدرس‌های بیت‌کوین.
-    کلید: address | مقدار: (timestamp, result_dict)
-    از time.time() استفاده می‌شود تا بین ری‌استارت‌ها هم معتبر باشد.
+    کش LRU با TTL.
+    برای اسکن تصادفی کلید تقریباً هیچ‌وقت hit نمی‌شود — با ENABLE_CACHE=False
+    کاملاً غیرفعال می‌شود تا سربار حافظه و قفل asyncio از بین برود.
     """
-    def __init__(self, max_size=50_000, ttl=3600):
+
+    def __init__(self, max_size=50_000, ttl=3600, enabled: bool = True):
+        self.enabled = enabled
         self.max_size = max_size
         self.ttl = ttl
         self.store = OrderedDict()
@@ -96,6 +161,8 @@ class BalanceCache:
         self.misses = 0
 
     async def get(self, address: str):
+        if not self.enabled:
+            return None
         async with self.lock:
             if address not in self.store:
                 self.misses += 1
@@ -110,6 +177,8 @@ class BalanceCache:
             return result
 
     async def set(self, address: str, result: dict):
+        if not self.enabled:
+            return
         async with self.lock:
             self.store[address] = (time.time(), result)
             self.store.move_to_end(address)
@@ -117,6 +186,8 @@ class BalanceCache:
                 self.store.popitem(last=False)
 
     async def load_from_disk(self):
+        if not self.enabled:
+            return
         if not CACHE_FILE.exists():
             return
         try:
@@ -132,6 +203,8 @@ class BalanceCache:
             print(f"⚠ خطا در بارگذاری کش: {e}")
 
     async def save_to_disk(self):
+        if not self.enabled:
+            return
         try:
             async with self.lock:
                 data = {
@@ -145,38 +218,108 @@ class BalanceCache:
             print(f"⚠ خطا در ذخیره کش: {e}")
 
 
+# ==================== API error detection ====================
+def _detect_api_error(data) -> str | None:
+    """
+    تشخیص خطای API در بدنه‌ی JSON که با HTTP 200 برگشته است.
+
+    اکثر سرویس‌دهنده‌های بیت‌کوین خطا را با HTTP 200 و بدنه‌ی error برمی‌گردانند.
+    بدون این تشخیص، پارسرها خطا را به‌عنوان «موجودی صفر» تفسیر می‌کنند.
+
+    الگوهای پشتیبانی‌شده:
+      - {"error": "..."}                    → blockchain.info, blockcypher, bitaps
+      - {"err_no": N, "err_msg": "..."}     → btc.com
+      - {"data": null, "context": {"code": >=400, "error": "..."}} → blockchair
+    """
+    if not isinstance(data, dict):
+        return None
+
+    # الگوی عمومی error
+    if data.get("error"):
+        return f"error: {str(data['error'])[:200]}"
+
+    # الگوی btc.com
+    if "err_no" in data:
+        err_no = data.get("err_no")
+        if err_no not in (0, None):
+            msg = data.get("err_msg") or data.get("message") or ""
+            return f"err_no={err_no}: {str(msg)[:200]}"
+
+    # الگوی blockchair
+    ctx = data.get("context")
+    if isinstance(ctx, dict):
+        code = ctx.get("code")
+        if isinstance(code, int) and code >= 400:
+            return f"context code={code}: {str(ctx.get('error', ''))[:200]}"
+
+    return None
+
+
 # ==================== Provider ====================
 class BitcoinAPIProvider:
-    def __init__(self, name, base_url, parser=None, rate=3.0, impersonate=True):
+    BASE_BACKOFF = 45.0
+    MAX_BACKOFF = 600.0
+
+    def __init__(self, name, base_url, parser=None, rate=3.0,
+                 impersonate=True, timeout=None):
         self.name = name
         self.base_url = base_url
         self.parser = parser or self._default_mempool_parser
         self.rate_limiter = RateLimiter(rate_per_sec=rate, burst=3)
         self.impersonate = impersonate
+        self.timeout = timeout if timeout is not None else REQUEST_TIMEOUT
         self.fail_count = 0
         self.disabled_until = 0.0
         self.success_count = 0
+        self.backoff = self.BASE_BACKOFF
+        self.last_disable_reason = ""
+        self.consecutive_rate_limits = 0
 
     def is_available(self) -> bool:
         return time.monotonic() >= self.disabled_until
 
-    def mark_failure(self):
+    def mark_failure(self, reason: str = ""):
+        """خطاهای واقعی: timeout، SSL error، 5xx، پاسخ‌های error، مسدودسازی."""
         self.fail_count += 1
         if self.fail_count >= 3:
-            self.disabled_until = time.monotonic() + 45.0
+            self.disabled_until = time.monotonic() + self.backoff
+            self.last_disable_reason = reason or "unknown"
+            print(
+                f"⛔ [{self.name}] disabled for {self.backoff:.0f}s "
+                f"(reason: {self.last_disable_reason})"
+            )
             self.fail_count = 0
+            self.backoff = min(self.backoff * 2, self.MAX_BACKOFF)
+
+    def mark_rate_limited(self, reason: str = "429"):
+        """429 فشار معکوس است؛ provider را زنده نگه می‌دارد."""
+        self.consecutive_rate_limits += 1
+        if self.consecutive_rate_limits >= 30:
+            self.disabled_until = time.monotonic() + self.backoff
+            self.last_disable_reason = f"persistent {reason}"
+            print(
+                f"⛔ [{self.name}] disabled for {self.backoff:.0f}s "
+                f"(reason: persistent {reason} × {self.consecutive_rate_limits})"
+            )
+            self.consecutive_rate_limits = 0
+            self.backoff = min(self.backoff * 2, self.MAX_BACKOFF)
 
     def mark_success(self):
         self.fail_count = 0
         self.success_count += 1
+        self.consecutive_rate_limits = 0
+        if self.backoff != self.BASE_BACKOFF:
+            print(f"✅ [{self.name}] recovered — backoff reset")
+            self.backoff = self.BASE_BACKOFF
+            self.last_disable_reason = ""
 
     def build_url(self, address: str) -> str:
         return self.base_url.format(address=address)
 
     @staticmethod
     def _default_mempool_parser(data, address, provider_name):
-        chain = data.get("chain_stats", {})
-        mempool = data.get("mempool_stats", {})
+        chain = data.get("chain_stats", {}) if isinstance(data, dict) else {}
+        mempool = data.get("mempool_stats", {}) if isinstance(data, dict) else {}
         confirmed = int(chain.get("funded_txo_sum", 0)) - int(chain.get("spent_txo_sum", 0))
         unconfirmed = int(mempool.get("funded_txo_sum", 0)) - int(mempool.get("spent_txo_sum", 0))
         total = confirmed + unconfirmed
@@ -193,15 +336,15 @@ class BitcoinAPIProvider:
         }
 
 
+# ---------- اختصاصی هر provider ----------
+
 def _bitaps_parser(data, address, name):
-    # bitaps ممکن است پاسخ را داخل کلید "data" بدهد یا مستقیم — هر دو حالت را پشتیبانی می‌کنیم
     if isinstance(data, dict) and isinstance(data.get("data"), dict):
         b_data = data["data"]
     elif isinstance(data, dict):
         b_data = data
     else:
         b_data = {}
-
     confirmed = int(b_data.get("balance", 0) or 0)
     pending_rec = int(b_data.get("pendingReceivedAmount", 0) or 0)
     pending_sent = int(b_data.get("pendingSentAmount", 0) or 0)
@@ -220,42 +363,146 @@ def _bitaps_parser(data, address, name):
     }
 
 
+def _blockchain_info_parser(data, address, name):
+    if not isinstance(data, dict):
+        return {"address": address, "total_sats": 0, "tx_count": 0,
+                "confirmed_sats": 0, "unconfirmed_sats": 0,
+                "confirmed_btc": 0.0, "total_btc": 0.0, "provider": name}
+    confirmed = int(data.get("final_balance", 0) or 0)
+    received = int(data.get("total_received", 0) or 0)
+    spent = int(data.get("total_sent", 0) or 0)
+    tx_count = int(data.get("n_tx", 0) or 0)
+    return {
+        "address": address,
+        "confirmed_sats": confirmed,
+        "unconfirmed_sats": 0,
+        "total_sats": confirmed,
+        "confirmed_btc": confirmed / 100_000_000,
+        "total_btc": confirmed / 100_000_000,
+        "tx_count": tx_count,
+        "received_sats": received,
+        "spent_sats": spent,
+        "provider": name,
+    }
+
+
+def _blockchair_parser(data, address, name):
+    try:
+        addr_data = data["data"][address]["address"]
+    except (KeyError, TypeError):
+        return {"address": address, "total_sats": 0, "tx_count": 0,
+                "confirmed_sats": 0, "unconfirmed_sats": 0,
+                "confirmed_btc": 0.0, "total_btc": 0.0, "provider": name}
+    confirmed = int(addr_data.get("balance", 0) or 0)
+    tx_count = int(addr_data.get("transaction_count", 0) or 0)
+    return {
+        "address": address,
+        "confirmed_sats": confirmed,
+        "unconfirmed_sats": 0,
+        "total_sats": confirmed,
+        "confirmed_btc": confirmed / 100_000_000,
+        "total_btc": confirmed / 100_000_000,
+        "tx_count": tx_count,
+        "provider": name,
+    }
+
+
+def _btc_com_parser(data, address, name):
+    if not isinstance(data, dict):
+        return {"address": address, "total_sats": 0, "tx_count": 0,
+                "confirmed_sats": 0, "unconfirmed_sats": 0,
+                "confirmed_btc": 0.0, "total_btc": 0.0, "provider": name}
+    d = data.get("data") if isinstance(data.get("data"), dict) else data
+    confirmed = int(d.get("balance", 0) or 0)
+    tx_count = int(d.get("tx_count", 0) or 0)
+    return {
+        "address": address,
+        "confirmed_sats": confirmed,
+        "unconfirmed_sats": 0,
+        "total_sats": confirmed,
+        "confirmed_btc": confirmed / 100_000_000,
+        "total_btc": confirmed / 100_000_000,
+        "tx_count": tx_count,
+        "provider": name,
+    }
+
+
+def _blockcypher_parser(data, address, name):
+    if not isinstance(data, dict):
+        return {"address": address, "total_sats": 0, "tx_count": 0,
+                "confirmed_sats": 0, "unconfirmed_sats": 0,
+                "confirmed_btc": 0.0, "total_btc": 0.0, "provider": name}
+    confirmed = int(data.get("balance", 0) or 0)
+    unconfirmed = int(data.get("unconfirmed_balance", 0) or 0)
+    total = confirmed + unconfirmed
+    tx_count = int(data.get("final_n_tx", 0) or data.get("n_tx", 0) or 0)
+    return {
+        "address": address,
+        "confirmed_sats": confirmed,
+        "unconfirmed_sats": unconfirmed,
+        "total_sats": total,
+        "confirmed_btc": confirmed / 100_000_000,
+        "total_btc": total / 100_000_000,
+        "tx_count": tx_count,
+        "provider": name,
+    }
+
+
 def build_providers():
     return [
         BitcoinAPIProvider(
-            "mempool.space",
-            "https://mempool.space/api/address/{address}",
-            BitcoinAPIProvider._default_mempool_parser,
-            rate=4.0,
-            impersonate=True,
+            "blockchain.info",
+            "https://blockchain.info/rawaddr/{address}?limit=1",
+            _blockchain_info_parser,
+            rate=2.0, impersonate=True, timeout=8,
         ),
         BitcoinAPIProvider(
-            "blockstream.info",
-            "https://blockstream.info/api/address/{address}",
-            BitcoinAPIProvider._default_mempool_parser,
-            rate=4.0,
-            impersonate=True,
+            "blockchair",
+            "https://api.blockchair.com/bitcoin/dashboards/address/{address}",
+            _blockchair_parser,
+            rate=2.0, impersonate=True, timeout=8,
         ),
         BitcoinAPIProvider(
-            "mempool.ninja",
-            "https://mempool.ninja/api/address/{address}",
-            BitcoinAPIProvider._default_mempool_parser,
-            rate=4.0,
-            impersonate=True,
+            "blockcypher",
+            "https://api.blockcypher.com/v1/btc/main/addrs/{address}/balance",
+            _blockcypher_parser,
+            rate=2.0, impersonate=True, timeout=8,
         ),
         BitcoinAPIProvider(
-            "mempool.emzy.de",
-            "https://mempool.emzy.de/api/address/{address}",
-            BitcoinAPIProvider._default_mempool_parser,
-            rate=3.0,
-            impersonate=True,
+            "btc.com",
+            "https://chain.api.btc.com/v3/address/{address}",
+            _btc_com_parser,
+            rate=2.0, impersonate=True, timeout=8,
         ),
         BitcoinAPIProvider(
             "bitaps",
             "https://api.bitaps.com/btc/v1/blockchain/address/state/{address}",
             _bitaps_parser,
-            rate=2.0,
-            impersonate=True,
+            rate=1.5, impersonate=True, timeout=6,
+        ),
+        BitcoinAPIProvider(
+            "mempool.space",
+            "https://mempool.space/api/address/{address}",
+            BitcoinAPIProvider._default_mempool_parser,
+            rate=2.0, impersonate=True, timeout=3,
+        ),
+        BitcoinAPIProvider(
+            "blockstream.info",
+            "https://blockstream.info/api/address/{address}",
+            BitcoinAPIProvider._default_mempool_parser,
+            rate=2.0, impersonate=True, timeout=3,
+        ),
+        BitcoinAPIProvider(
+            "mempool.ninja",
+            "https://mempool.ninja/api/address/{address}",
+            BitcoinAPIProvider._default_mempool_parser,
+            rate=2.0, impersonate=True, timeout=3,
+        ),
+        BitcoinAPIProvider(
+            "mempool.emzy.de",
+            "https://mempool.emzy.de/api/address/{address}",
+            BitcoinAPIProvider._default_mempool_parser,
+            rate=2.0, impersonate=True, timeout=3,
         ),
     ]
 
@@ -274,10 +521,8 @@ class ProxyPool:
             return
         with open(path, "r", encoding="utf-8") as f:
             raw = [l.strip() for l in f if l.strip() and not l.startswith("#")]
-
         self.proxies = []
         for p in raw:
-            # اطمینان از داشتن اسکیم (http:// یا socks5://)
             if "://" not in p:
                 p = f"http://{p}"
             self.proxies.append(p)
@@ -326,6 +571,7 @@ REFERERS = [
     "https://www.bing.com/",
     "https://mempool.space/",
     "https://blockstream.info/",
+    "https://blockchain.info/",
     "https://bitcoin.org/",
 ]
 
@@ -347,28 +593,43 @@ def build_headers(ua: str) -> dict:
 
 # ==================== Balance Checker ====================
 class BalanceChecker:
-    def __init__(self, providers, proxy_pool: ProxyPool, ua_mgr: UAManager, cache: BalanceCache):
+    def __init__(self, providers, proxy_pool: ProxyPool, ua_mgr: UAManager,
+                 cache: BalanceCache, max_concurrent: int = MAX_CONCURRENT_REQUESTS):
         self.providers = providers
         self.proxy_pool = proxy_pool
         self.ua_mgr = ua_mgr
         self.cache = cache
-        self.session: AsyncSession | None = None
+        # یک session به ازای هر پروکسی — Connection Pooling حفظ می‌شود
+        self._sessions: dict[str, AsyncSession] = {}
+        self._sessions_lock = asyncio.Lock()
+        self._sem = asyncio.Semaphore(max_concurrent)
 
     async def __aenter__(self):
-        self.session = AsyncSession()
         return self
 
     async def __aexit__(self, *exc):
-        if self.session:
-            await self.session.close()
+        for sess in self._sessions.values():
+            try:
+                await sess.close()
+            except Exception:
+                pass
+        self._sessions.clear()
+
+    async def _get_session(self, proxy_url: str | None) -> AsyncSession:
+        key = proxy_url or "__direct__"
+        async with self._sessions_lock:
+            sess = self._sessions.get(key)
+            if sess is None:
+                if proxy_url:
+                    sess = AsyncSession(
+                        proxies={"http": proxy_url, "https": proxy_url}
+                    )
+                else:
+                    sess = AsyncSession()
+                self._sessions[key] = sess
+            return sess
 
     async def check(self, address: str):
-        """
-        چند API رو با fallback امتحان می‌کنه؛ ابتدا کش بررسی می‌شه.
-        خروجی: (result | None, api_call_made: bool)
-        - اگر از کش برگردد: api_call_made = False
-        - اگر درخواست واقعی به API زده شود (حتی در صورت شکست): api_call_made = True
-        """
         cached = await self.cache.get(address)
         if cached is not None:
             return cached, False
@@ -384,27 +645,41 @@ class BalanceChecker:
 
             for attempt in range(MAX_RETRIES_PER_PROVIDER):
                 try:
-                    await provider.rate_limiter.acquire()
-                    url = provider.build_url(address)
-                    headers = build_headers(self.ua_mgr.next())
-                    proxies = await self.proxy_pool.get()
-                    impersonate = random.choice(IMPERSONATE_TARGETS) if provider.impersonate else None
+                    async with self._sem:
+                        await provider.rate_limiter.acquire()
+                        url = provider.build_url(address)
+                        headers = build_headers(self.ua_mgr.next())
 
-                    api_call_made = True
-                    r = await self.session.get(
-                        url,
-                        headers=headers,
-                        proxies=proxies,
-                        timeout=REQUEST_TIMEOUT,
-                        impersonate=impersonate,
-                    )
+                        proxy_dict = await self.proxy_pool.get()
+                        proxy_url = None
+                        if proxy_dict:
+                            proxy_url = proxy_dict.get("http") or proxy_dict.get("https")
+
+                        session = await self._get_session(proxy_url)
+                        impersonate = (
+                            random.choice(IMPERSONATE_TARGETS)
+                            if provider.impersonate else None
+                        )
+
+                        api_call_made = True
+                        r = await session.get(
+                            url,
+                            headers=headers,
+                            timeout=provider.timeout,
+                            impersonate=impersonate,
+                        )
 
                     if r.status_code == 429:
-                        await asyncio.sleep(1.5 * (attempt + 1))
+                        print(f"⚠ [{provider.name}] 429 rate-limited")
+                        await provider.rate_limiter.back_off(provider.name)
+                        provider.mark_rate_limited("429")
+                        await asyncio.sleep(1.0 * (attempt + 1))
                         continue
 
                     if r.status_code == 404:
+                        # اکثر APIهای بیت‌کوین برای آدرس دیده‌نشده 404 برمی‌گردانند
                         provider.mark_success()
+                        await provider.rate_limiter.speed_up()
                         res = {
                             "address": address, "confirmed_sats": 0,
                             "unconfirmed_sats": 0, "total_sats": 0,
@@ -415,27 +690,47 @@ class BalanceChecker:
                         return res, True
 
                     if r.status_code in (401, 403, 451):
-                        provider.mark_failure()
+                        print(f"⚠ [{provider.name}] HTTP {r.status_code} (blocked)")
+                        provider.mark_failure(f"HTTP {r.status_code}")
                         break
 
                     if r.status_code >= 400:
+                        print(f"⚠ [{provider.name}] HTTP {r.status_code}")
                         if attempt < MAX_RETRIES_PER_PROVIDER - 1:
                             await asyncio.sleep(0.5 * (attempt + 1))
                             continue
-                        provider.mark_failure()
+                        provider.mark_failure(f"HTTP {r.status_code}")
                         break
 
-                    data = r.json()
+                    try:
+                        data = r.json()
+                    except Exception as e:
+                        print(f"⚠ [{provider.name}] JSON parse failed: {e}")
+                        provider.mark_failure("JSON parse")
+                        break
+
+                    # تشخیص خطای API در بدنه (HTTP 200 با error)
+                    err = _detect_api_error(data)
+                    if err is not None:
+                        print(f"⚠ [{provider.name}] API error: {err}")
+                        provider.mark_failure("api-error")
+                        break
+
                     result = provider.parser(data, address, provider.name)
                     provider.mark_success()
+                    await provider.rate_limiter.speed_up()
                     await self.cache.set(address, result)
                     return result, True
 
-                except Exception:
+                except Exception as e:
+                    print(
+                        f"⚠ [{provider.name}] request error: "
+                        f"{type(e).__name__}: {e}"
+                    )
                     if attempt < MAX_RETRIES_PER_PROVIDER - 1:
                         await asyncio.sleep(0.5 * (attempt + 1))
                         continue
-                    provider.mark_failure()
+                    provider.mark_failure(type(e).__name__)
                     break
 
         return None, api_call_made
@@ -458,11 +753,16 @@ def public_key_to_native_segwit(pub_bytes: bytes, hrp=HRP) -> str:
 def private_key_to_addresses(pk_hex: str):
     try:
         key = Key.from_hex(pk_hex)
-        return {
+        all_addresses = {
             "Legacy (P2PKH)": key.address,
             "Nested SegWit (P2SH-P2WPKH)": key.segwit_address,
             "Native SegWit (P2WPKH)": public_key_to_native_segwit(key.public_key),
-        }, key
+        }
+        filtered = {
+            k: v for k, v in all_addresses.items()
+            if k in CHECK_ADDRESS_TYPES
+        }
+        return filtered, key
     except Exception as e:
         print(f"⚠ خطا در تبدیل کلید: {e}")
         return None, None
@@ -477,6 +777,7 @@ class Stats:
         self.start_time = time.monotonic()
         self.provider_stats = {p.name: {"success": 0, "fail": 0} for p in providers}
         self.found = False
+        self.last_all_down_warn = 0.0
 
     async def incr_keys(self):
         async with self.lock:
@@ -526,6 +827,7 @@ def save_stats(stats: Stats, cache: BalanceCache):
         f.write(f"درخواست‌های API:   {stats.total_requests}\n")
         f.write(f"زمان اجرا:         {elapsed:.2f} ثانیه\n")
         f.write(f"نرخ درخواست:       {rate:.2f} req/s\n")
+        f.write(f"کش فعال:           {'بله' if cache.enabled else 'خیر'}\n")
         f.write(f"کش hit rate:       {hit_rate:.1f}%\n\n")
         f.write("آمار Providerها:\n")
         for name, s in stats.provider_stats.items():
@@ -541,6 +843,19 @@ async def worker(
     print_lock: asyncio.Lock,
 ):
     while not stop_event.is_set():
+        if not any(p.is_available() for p in checker.providers):
+            async with print_lock:
+                now = time.monotonic()
+                if now - stats.last_all_down_warn >= 30.0:
+                    stats.last_all_down_warn = now
+                    reasons = ", ".join(
+                        f"{p.name}→{p.last_disable_reason or '?'}"
+                        for p in checker.providers
+                    )
+                    print(f"⏸ همه‌ی APIها غیرفعال — 5s صبر. دلایل: {reasons}")
+            await asyncio.sleep(5.0)
+            continue
+
         pk_hex = generate_private_key()
         addresses, _ = private_key_to_addresses(pk_hex)
         if not addresses:
@@ -555,12 +870,13 @@ async def worker(
                 active = sum(1 for p in checker.providers if p.is_available())
                 cache_total = checker.cache.hits + checker.cache.misses
                 hit_rate = (checker.cache.hits / cache_total * 100) if cache_total > 0 else 0
+                cache_label = f"{hit_rate:.0f}%" if checker.cache.enabled else "off"
                 print(
                     f"📊 کلید #{n} | "
                     f"{stats.total_requests} req | "
                     f"{elapsed:.1f}s | {rate:.2f} req/s | "
                     f"API فعال: {active}/{len(checker.providers)} | "
-                    f"کش: {hit_rate:.0f}%"
+                    f"کش: {cache_label}"
                 )
 
         for kind, addr in addresses.items():
@@ -569,7 +885,6 @@ async def worker(
 
             info, api_call_made = await checker.check(addr)
 
-            # فقط درخواست‌های واقعی API را می‌شماریم، نه hitهای کش
             if api_call_made:
                 if info is None:
                     await stats.incr_requests(None, ok=False)
@@ -586,19 +901,25 @@ async def worker(
 
 # ==================== Main ====================
 async def main():
-    # ابتدا providers ساخته می‌شود چون در print و Stats استفاده می‌شود
     providers = build_providers()
 
     print("=" * 70)
     print("  اسکنر بیت‌کوین — نسخه async + curl_cffi + Cache")
     print("  ویژگی‌ها: TLS Fingerprint مرورگر | Multi-API سالم | LRU Cache | Proxy Rotation")
     print(f"  تعداد APIها: {len(providers)} | Workerها: {NUM_WORKERS}")
+    print(f"  نوع آدرس‌های چک‌شونده: {', '.join(CHECK_ADDRESS_TYPES)}")
+    print(f"  سقف اتصال همزمان: {MAX_CONCURRENT_REQUESTS}")
+    print(f"  کش: {'فعال' if ENABLE_CACHE else 'غیرفعال'}")
     print("  برای توقف: Ctrl+C")
     print("=" * 70)
 
     proxy_pool = ProxyPool(PROXY_FILE)
     ua_mgr = UAManager(UA_FILE)
-    cache = BalanceCache(max_size=CACHE_MAX_SIZE, ttl=CACHE_TTL)
+    cache = BalanceCache(
+        max_size=CACHE_MAX_SIZE,
+        ttl=CACHE_TTL,
+        enabled=ENABLE_CACHE,
+    )
     await cache.load_from_disk()
 
     stats = Stats(providers)
@@ -612,7 +933,6 @@ async def main():
             print("\n⏹ درخواست توقف دریافت شد...")
             stop_event.set()
 
-    # ثبت سیگنال‌ها: در لینوکس/مک از add_signal_handler، در ویندوز fallback به signal.signal
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, _stop)
@@ -626,7 +946,10 @@ async def main():
                 pass
 
     try:
-        async with BalanceChecker(providers, proxy_pool, ua_mgr, cache) as checker:
+        async with BalanceChecker(
+            providers, proxy_pool, ua_mgr, cache,
+            max_concurrent=MAX_CONCURRENT_REQUESTS,
+        ) as checker:
             tasks = [
                 asyncio.create_task(
                     worker(i, checker, stats, stop_event, print_lock),
@@ -657,7 +980,10 @@ async def main():
     save_stats(stats, cache)
     print(f"\n📁 آمار در {STATS_FILE} ذخیره شد.")
     print(f"⏱  زمان کل: {stats.elapsed:.1f}s | کلیدها: {stats.total_keys}")
-    print(f"📦 کش: {cache.hits} hit / {cache.misses} miss")
+    if cache.enabled:
+        print(f"📦 کش: {cache.hits} hit / {cache.misses} miss")
+    else:
+        print("📦 کش: غیرفعال بود")
     print("👋 پایان.")
 
 

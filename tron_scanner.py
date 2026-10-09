@@ -3,18 +3,29 @@ TRON Address Scanner (Educational)
 - بررسی همزمان موجودی TRX و USDT (TRC-20)
 - Async I/O با curl_cffi (جعل TLS/JA3 مرورگر)
 - Multi-API با fallback و health-check
-- پشتیبانی از TronGrid API Key
-- کش نتایج برای جلوگیری از درخواست تکراری
+- پشتیبانی از TronGrid API Key (فقط از متغیر محیطی)
+- کش نتایج برای جلوگیری از درخواست تکراری (قابل خاموش کردن)
 - چرخش پروکسی
 - Worker Pool با asyncio
-- Rate limiter Token Bucket برای هر Provider
+- Rate limiter Token Bucket تطبیقی (AIMD) برای هر Provider
 
-بهینه‌سازی‌های اعمال‌شده:
-  1) Skip درخواست USDT برای اکانت‌های ناموجود روی زنجیره
-  2) حالت batch JSON-RPC (eth_getBalance + eth_call) برای مانیتورینگ
-  3) asyncio.Semaphore برای کنترل سقف اتصال‌های همزمان curl_cffi
+اصلاحات نسخه‌ی جدید:
+  - RateLimiter با back_off / speed_up (AIMD)
+  - TronAPIProvider با mark_rate_limited جدا از mark_failure
+  - 429 دیگر provider را disable نمی‌کند؛ فقط rate را کم می‌کند
+  - mark_success اکنون rate را به آرامی برمی‌گرداند
+  - DoH غیرفعال شد (از ایران بلاک است و proxies.txt هم IP محلی است)
+  - ProxyPool فقط یک بار ساخته می‌شود
+  - نرخ اولیه TronGrid از 6.0 به 2.0 کاهش یافت (IP اشتراکی تونل)
+
+اصلاحات این نسخه:
+  ۱) TRONGRID_API_KEY حالا فقط از متغیر محیطی خوانده می‌شود
+     (متغیر TRONGRID_API_KEY یا فایل .env در کنار اسکریپت)
+  ۲) ENABLE_CACHE به‌عنوان سوئیچ اضافه شد — برای اسکن تصادفی خاموش کنید
+  ۳) بررسی کلید "error" در پاسخ‌های JSON-RPC batch و علامت‌گذاری provider
 """
 import asyncio
+import os
 import sys
 import time
 import signal
@@ -26,8 +37,15 @@ from pathlib import Path
 from itertools import cycle
 from collections import OrderedDict
 
+# بارگذاری اختیاری از فایل .env (در صورت نصب python-dotenv)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 from curl_cffi.requests import AsyncSession
-from tronpy.keys import PrivateKey, to_hex_address
+from tronpy.keys import PrivateKey, to_hex_address, public_key_to_addr
 
 # ==================== تنظیمات ====================
 NUM_WORKERS = 6
@@ -42,13 +60,22 @@ USE_JSONRPC_BATCH = False
 # بهینه‌سازی ۳ — سقف اتصال‌های همزمان curl_cffi
 MAX_CONCURRENT_REQUESTS = 32
 
-TRONGRID_API_KEY = ""   # از https://www.trongrid.io/ بگیر
+# سوئیچ کش:
+#   False → برای اسکن تصادفی کلید (احتمال برخورد تقریباً صفر است)
+#   True  → برای مانیتورینگ لیست ثابتی از آدرس‌ها
+ENABLE_CACHE = False
+
+# ---- کلید API فقط از متغیر محیطی خوانده می‌شود ----
+#   export TRONGRID_API_KEY="your-key-here"
+# یا یک فایل .env در کنار اسکریپت با محتوای زیر:
+#   TRONGRID_API_KEY=your-key-here
+# از https://www.trongrid.io/ بگیرید.
+TRONGRID_API_KEY = os.environ.get("TRONGRID_API_KEY", "").strip()
 
 USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
 USDT_DECIMALS = 6
 
 # eth_getBalance روی TronGrid مقدار را بر حسب SUN برمی‌گرداند.
-# اگر provider شما wei (۱۸ رقم اعشار) برگرداند، به 10**18 تغییر دهید.
 ETH_BALANCE_UNIT = 1_000_000
 
 FOUND_FILE = Path("found_tron_wallets.txt")
@@ -75,10 +102,23 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
         pass
 
 
-# ==================== Rate Limiter ====================
+# ==================== Rate Limiter (AIMD) ====================
 class RateLimiter:
-    def __init__(self, rate_per_sec: float, burst: int = 3):
+    """
+    Token bucket با AIMD:
+      - back_off() : کاهش ضربی روی 429
+      - speed_up() : افزایش تدریجی روی موفقیت
+    """
+
+    def __init__(self, rate_per_sec: float, burst: int = 3,
+                 min_rate: float | None = None):
+        self.initial_rate = rate_per_sec
         self.rate = rate_per_sec
+        self.min_rate = (
+            min_rate if min_rate is not None
+            else max(0.05, rate_per_sec * 0.05)
+        )
+        self.initial_capacity = burst
         self.capacity = burst
         self.tokens = float(burst)
         self.last = time.monotonic()
@@ -90,7 +130,7 @@ class RateLimiter:
                 now = time.monotonic()
                 self.tokens = min(
                     self.capacity,
-                    self.tokens + (now - self.last) * self.rate
+                    self.tokens + (now - self.last) * self.rate,
                 )
                 self.last = now
                 if self.tokens >= 1.0:
@@ -99,15 +139,40 @@ class RateLimiter:
                 wait = (1.0 - self.tokens) / self.rate
             await asyncio.sleep(wait)
 
+    async def back_off(self, label: str = ""):
+        async with self.lock:
+            old_rate = self.rate
+            old_burst = self.capacity
+            self.rate = max(self.min_rate, self.rate * 0.5)
+            self.capacity = max(1, self.capacity // 2)
+            self.tokens = 0.0
+            if old_rate != self.rate or old_burst != self.capacity:
+                tag = f"[{label}] " if label else ""
+                print(
+                    f"    ↳ {tag}rate {old_rate:.2f}→{self.rate:.2f} req/s, "
+                    f"burst {old_burst}→{self.capacity}"
+                )
+
+    async def speed_up(self):
+        async with self.lock:
+            if self.rate < self.initial_rate:
+                self.rate = min(self.initial_rate, self.rate * 1.05)
+            if self.capacity < self.initial_capacity:
+                self.capacity = min(self.initial_capacity, self.capacity + 1)
+
 
 # ==================== Cache ====================
 class BalanceCache:
     """
     کش LRU با TTL برای نتایج موجودی.
     از time.time() استفاده می‌شود تا بین ری‌استارت/ریبوت هم TTL معتبر بماند.
+
+    نکته: برای اسکن تصادفی کلید، این کش تقریباً هیچ‌وقت hit نمی‌شود و
+    صرفاً سربار حافظه و CPU است. با ENABLE_CACHE=False خاموش می‌شود.
     """
 
-    def __init__(self, max_size=50_000, ttl=3600):
+    def __init__(self, max_size=50_000, ttl=3600, enabled: bool = True):
+        self.enabled = enabled
         self.max_size = max_size
         self.ttl = ttl
         self.store = OrderedDict()
@@ -116,6 +181,8 @@ class BalanceCache:
         self.misses = 0
 
     async def get(self, address: str):
+        if not self.enabled:
+            return None
         async with self.lock:
             if address not in self.store:
                 self.misses += 1
@@ -130,6 +197,8 @@ class BalanceCache:
             return result
 
     async def set(self, address: str, result: dict):
+        if not self.enabled:
+            return
         async with self.lock:
             self.store[address] = (time.time(), result)
             self.store.move_to_end(address)
@@ -137,6 +206,8 @@ class BalanceCache:
                 self.store.popitem(last=False)
 
     async def load_from_disk(self):
+        if not self.enabled:
+            return
         if not CACHE_FILE.exists():
             return
         try:
@@ -152,6 +223,8 @@ class BalanceCache:
             print(f"⚠ خطا در بارگذاری کش: {e}")
 
     async def save_to_disk(self):
+        if not self.enabled:
+            return
         try:
             async with self.lock:
                 data = {
@@ -169,25 +242,56 @@ class BalanceCache:
 
 # ==================== Provider ====================
 class TronAPIProvider:
+    BASE_BACKOFF = 60.0
+    MAX_BACKOFF = 900.0  # 15 min cap
+
     def __init__(self, name, rate=3.0):
         self.name = name
         self.rate_limiter = RateLimiter(rate_per_sec=rate, burst=3)
         self.fail_count = 0
         self.disabled_until = 0.0
         self.success_count = 0
+        self.backoff = self.BASE_BACKOFF
+        self.last_disable_reason = ""
+        self.consecutive_rate_limits = 0
 
     def is_available(self) -> bool:
         return time.monotonic() >= self.disabled_until
 
-    def mark_failure(self):
+    def mark_failure(self, reason: str = ""):
+        """خطاهای واقعی: timeout، SSL error، 5xx، مسدودسازی."""
         self.fail_count += 1
         if self.fail_count >= 3:
-            self.disabled_until = time.monotonic() + 60.0
+            self.disabled_until = time.monotonic() + self.backoff
+            self.last_disable_reason = reason or "unknown"
+            print(
+                f"⛔ [{self.name}] disabled for {self.backoff:.0f}s "
+                f"(reason: {self.last_disable_reason})"
+            )
             self.fail_count = 0
+            self.backoff = min(self.backoff * 2, self.MAX_BACKOFF)
+
+    def mark_rate_limited(self, reason: str = "429"):
+        """429 فشار معکوس است؛ provider را زنده نگه می‌دارد."""
+        self.consecutive_rate_limits += 1
+        if self.consecutive_rate_limits >= 30:
+            self.disabled_until = time.monotonic() + self.backoff
+            self.last_disable_reason = f"persistent {reason}"
+            print(
+                f"⛔ [{self.name}] disabled for {self.backoff:.0f}s "
+                f"(reason: persistent {reason} × {self.consecutive_rate_limits})"
+            )
+            self.consecutive_rate_limits = 0
+            self.backoff = min(self.backoff * 2, self.MAX_BACKOFF)
 
     def mark_success(self):
         self.fail_count = 0
         self.success_count += 1
+        self.consecutive_rate_limits = 0
+        if self.backoff != self.BASE_BACKOFF:
+            print(f"✅ [{self.name}] recovered — backoff reset")
+            self.backoff = self.BASE_BACKOFF
+            self.last_disable_reason = ""
 
     def build_requests(self, address: str):
         raise NotImplementedError
@@ -222,10 +326,11 @@ def _tron_to_evm_hex(address: str) -> str:
 
 
 class TronGridProvider(TronAPIProvider):
-    BALANCE_OF_SELECTOR = "70a08231"  # keccak256("balanceOf(address)")[:4]
+    BALANCE_OF_SELECTOR = "70a08231"
 
     def __init__(self):
-        super().__init__("trongrid", rate=6.0)
+        # rate اولیه پایین — تونل اشتراکی است و TronGrid per-IP rate-limit می‌کند
+        super().__init__("trongrid", rate=2.0)
         self.base_url = "https://api.trongrid.io"
         self.jsonrpc_url = f"{self.base_url}/jsonrpc"
         self.use_batch = USE_JSONRPC_BATCH
@@ -234,14 +339,12 @@ class TronGridProvider(TronAPIProvider):
             self._extra_headers["TRON-PRO-API-KEY"] = TRONGRID_API_KEY
 
     # ---------- Request builders ----------
-
     def build_requests(self, address):
         if self.use_batch:
             return self._build_batch(address)
         return self._build_native(address)
 
     def _build_native(self, address):
-        """حالت پیش‌فرض: دو درخواست جدا، با قابلیت skip."""
         trx_url = f"{self.base_url}/wallet/getaccount"
         trx_body = {"address": address, "visible": True}
 
@@ -261,7 +364,6 @@ class TronGridProvider(TronAPIProvider):
         ]
 
     def _build_batch(self, address):
-        """حالت batch: یک POST با آرایه‌ی دو متد JSON-RPC 2.0."""
         evm = _tron_to_evm_hex(address)
         trx_req = {
             "jsonrpc": "2.0",
@@ -285,10 +387,8 @@ class TronGridProvider(TronAPIProvider):
         return self._extra_headers
 
     # ---------- Native parsers ----------
-
     @staticmethod
     def parse_trx(data, address, provider_name):
-        # wallet/getaccount برای اکانت ناموجود {} برمی‌گرداند
         if not data:
             return {
                 "address": address, "total_sun": 0, "total_trx": 0.0,
@@ -300,7 +400,7 @@ class TronGridProvider(TronAPIProvider):
             "total_trx": balance_sun / 1_000_000,
             "tx_count": data.get("transactions", 0) or 0,
             "provider": provider_name,
-            "active": True,  # اکانت روی زنجیره وجود دارد
+            "active": True,
         }
 
     @staticmethod
@@ -317,7 +417,6 @@ class TronGridProvider(TronAPIProvider):
             return {"usdt_sun": 0, "usdt": 0.0}
 
     # ---------- JSON-RPC parsers ----------
-
     @staticmethod
     def parse_eth_balance(hex_result, address, provider_name):
         if hex_result is None:
@@ -331,7 +430,6 @@ class TronGridProvider(TronAPIProvider):
             "total_trx": sun / ETH_BALANCE_UNIT,
             "tx_count": 0,
             "provider": provider_name,
-            # eth_getBalance وجود اکانت را نشان نمی‌دهد؛ فقط موجودی.
             "active": sun > 0,
         }
 
@@ -345,9 +443,24 @@ class TronGridProvider(TronAPIProvider):
         except Exception:
             return {"usdt_sun": 0, "usdt": 0.0}
 
+    @staticmethod
+    def extract_batch_errors(data) -> list:
+        """
+        اگر پاسخ JSON-RPC شامل آیتمی با کلید "error" باشد، فهرست خطاها را برمی‌گرداند.
+        ساختار خطای ممکن: {"code": -32602, "message": "..."}
+        """
+        errors = []
+        if not isinstance(data, list):
+            return errors
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            if "error" in item and item["error"]:
+                errors.append(item.get("error"))
+        return errors
+
     @classmethod
     def parse_batch(cls, data, address, provider_name):
-        """پاسخ آرایه‌ای JSON-RPC batch → (trx_result, usdt_result)"""
         if not isinstance(data, list):
             return None, None
         trx_result = None
@@ -540,7 +653,6 @@ class BalanceChecker:
         self.ua_mgr = ua_mgr
         self.cache = cache
         self.session: AsyncSession | None = None
-        # بهینه‌سازی ۳: سقف اتصال‌های همزمان
         self._sem = asyncio.Semaphore(max_concurrent)
 
     async def __aenter__(self):
@@ -552,7 +664,6 @@ class BalanceChecker:
             await self.session.close()
 
     async def _request(self, provider, url, method, body):
-        """یک درخواست شبکه‌ای با Semaphore + rate limiting + proxies + impersonate"""
         async with self._sem:
             await provider.rate_limiter.acquire()
             headers = build_headers(self.ua_mgr.next(), provider.headers())
@@ -590,7 +701,8 @@ class BalanceChecker:
 
             try:
                 requests_list = provider.build_requests(address)
-            except Exception:
+            except Exception as e:
+                print(f"⚠ [{provider.name}] build_requests failed: {e}")
                 continue
 
             trx_result = None
@@ -602,8 +714,7 @@ class BalanceChecker:
                 if kind == "usdt" and usdt_result is not None:
                     continue
 
-                # بهینه‌سازی ۱: اگر اکانت روی زنجیره وجود ندارد،
-                # درخواست USDT را کاملاً حذف کن.
+                # بهینه‌سازی ۱: skip USDT برای اکانت‌های ناموجود
                 if (kind == "usdt"
                         and trx_result is not None
                         and not trx_result.get("active")):
@@ -615,21 +726,45 @@ class BalanceChecker:
                     r = await self._request(provider, url, method, body)
 
                     if r.status_code == 429:
-                        await asyncio.sleep(2.0)
+                        print(f"⚠ [{provider.name}] 429 rate-limited")
+                        await provider.rate_limiter.back_off(provider.name)
+                        provider.mark_rate_limited("429")
+                        await asyncio.sleep(1.0)
                         break
+
                     if r.status_code in (401, 403, 451):
-                        provider.mark_failure()
+                        print(f"⚠ [{provider.name}] HTTP {r.status_code} (blocked)")
+                        provider.mark_failure(f"HTTP {r.status_code}")
                         break
                     if r.status_code >= 400:
+                        print(f"⚠ [{provider.name}] HTTP {r.status_code}")
+                        provider.mark_failure(f"HTTP {r.status_code}")
                         break
 
                     try:
                         data = r.json()
-                    except Exception:
+                    except Exception as e:
+                        print(f"⚠ [{provider.name}] JSON parse failed: {e}")
                         data = None
 
-                    # بهینه‌سازی ۲: پاسخ batch را جدا پارس کن
                     if kind == "batch":
+                        # بررسی خطاهای JSON-RPC قبل از پارس نتیجه
+                        errors = TronGridProvider.extract_batch_errors(data)
+                        if errors:
+                            first = errors[0]
+                            # اگر دیکشنری باشد، فقط پیام را نمایش بده
+                            if isinstance(first, dict):
+                                msg = first.get("message", str(first))
+                                code = first.get("code", "?")
+                                print(
+                                    f"⚠ [{provider.name}] JSON-RPC error "
+                                    f"(code={code}): {msg}"
+                                )
+                            else:
+                                print(f"⚠ [{provider.name}] JSON-RPC error: {first}")
+                            provider.mark_failure("jsonrpc-error")
+                            break
+
                         b_trx, b_usdt = provider.parse_batch(
                             data, address, provider.name
                         )
@@ -644,10 +779,15 @@ class BalanceChecker:
                     if kind in ("usdt", "both"):
                         usdt_result = provider.parse_usdt(data, address, provider.name)
 
-                except Exception:
+                except Exception as e:
+                    print(
+                        f"⚠ [{provider.name}] request error: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                    provider.mark_failure(type(e).__name__)
                     break
 
-            # اگر TRX داریم ولی USDT نداریم، از provider بعدی USDT را بگیر
+            # اگر TRX داریم ولی USDT نداریم، از provider بعدی USDT بگیر
             if trx_result is not None and usdt_result is None:
                 for p2 in ordered:
                     if p2 is provider or not p2.is_available():
@@ -677,6 +817,7 @@ class BalanceChecker:
 
             if trx_result is not None:
                 provider.mark_success()
+                await provider.rate_limiter.speed_up()
                 final = {
                     **trx_result,
                     "usdt_sun": (usdt_result or {}).get("usdt_sun", 0),
@@ -698,6 +839,7 @@ def generate_private_key_bytes() -> bytes:
 
 def private_key_to_address(pk_bytes: bytes) -> str | None:
     try:
+
         return PrivateKey(pk_bytes).public_key.to_base58check_address()
     except Exception as e:
         print(f"⚠ خطا در تبدیل کلید: {e}")
@@ -713,6 +855,7 @@ class Stats:
         self.start_time = time.monotonic()
         self.provider_stats = {p.name: {"success": 0, "fail": 0} for p in providers}
         self.found = False
+        self.last_all_down_warn = 0.0
 
     async def incr_keys(self):
         async with self.lock:
@@ -760,6 +903,7 @@ def save_stats(stats: Stats, cache: BalanceCache):
         f.write(f"درخواست‌های شبکه:  {stats.total_requests}\n")
         f.write(f"زمان اجرا:         {elapsed:.2f} ثانیه\n")
         f.write(f"نرخ:               {rate:.2f} req/s\n")
+        f.write(f"کش فعال:           {'بله' if cache.enabled else 'خیر'}\n")
         f.write(f"کش hits:           {cache.hits}\n")
         f.write(f"کش misses:         {cache.misses}\n")
         f.write(f"کش hit rate:       {hit_rate:.1f}%\n\n")
@@ -777,6 +921,20 @@ async def worker(
     print_lock: asyncio.Lock,
 ):
     while not stop_event.is_set():
+        # اگر همه‌ی providerها disabled هستند، نچرخ — منتظر بازیابی بمان.
+        if not any(p.is_available() for p in checker.providers):
+            async with print_lock:
+                now = time.monotonic()
+                if now - stats.last_all_down_warn >= 30.0:
+                    stats.last_all_down_warn = now
+                    reasons = ", ".join(
+                        f"{p.name}→{p.last_disable_reason or '?'}"
+                        for p in checker.providers
+                    )
+                    print(f"⏸ همه‌ی APIها غیرفعال — 5s صبر. دلایل: {reasons}")
+            await asyncio.sleep(5.0)
+            continue
+
         pk_bytes = generate_private_key_bytes()
         pk_hex = pk_bytes.hex()
         address = private_key_to_address(pk_bytes)
@@ -792,17 +950,17 @@ async def worker(
                 active = sum(1 for p in checker.providers if p.is_available())
                 cache_total = checker.cache.hits + checker.cache.misses
                 hit_rate = (checker.cache.hits / cache_total * 100) if cache_total > 0 else 0
+                cache_label = f"{hit_rate:.0f}%" if checker.cache.enabled else "off"
                 print(
                     f"📊 کلید #{n} | "
                     f"{stats.total_requests} req | "
                     f"{elapsed:.1f}s | {rate:.2f} req/s | "
                     f"API فعال: {active}/{len(checker.providers)} | "
-                    f"کش: {hit_rate:.0f}%"
+                    f"کش: {cache_label}"
                 )
 
         info, api_call_made = await checker.check(address)
 
-        # فقط درخواست‌های واقعی API شمرده می‌شوند، نه hitهای کش
         if api_call_made:
             if info is None:
                 await stats.incr_requests(None, ok=False)
@@ -825,7 +983,6 @@ async def worker(
 
 # ==================== Main ====================
 def _install_signal_handlers(loop, stop_event):
-    """نصب signal handler سازگار با لینوکس + ویندوز"""
     def _stop():
         if not stop_event.is_set():
             print("\n⏹ درخواست توقف دریافت شد...")
@@ -835,7 +992,6 @@ def _install_signal_handlers(loop, stop_event):
         try:
             loop.add_signal_handler(sig, _stop)
         except (NotImplementedError, AttributeError):
-            # ویندوز: fallback به signal.signal + call_soon_threadsafe
             try:
                 signal.signal(sig, lambda *_: loop.call_soon_threadsafe(_stop))
             except (ValueError, OSError, RuntimeError):
@@ -853,17 +1009,24 @@ async def main():
     else:
         print("  ⚡ حالت native + skip-empty فعال (مناسب اسکن)")
     print(f"  سقف اتصال همزمان: {MAX_CONCURRENT_REQUESTS}")
+    print(f"  کش: {'فعال' if ENABLE_CACHE else 'غیرفعال'}")
     if TRONGRID_API_KEY:
-        print("  ✅ TronGrid API Key فعال")
+        print(f"  ✅ TronGrid API Key فعال (طول={len(TRONGRID_API_KEY)})")
     else:
         print("  ⚠ TronGrid API Key تنظیم نشده — محدودیت نرخ شدیدتر")
+        print("     برای تنظیم: export TRONGRID_API_KEY=\"your-key-here\"")
     print("  برای توقف: Ctrl+C")
     print("=" * 70)
 
+    # DoH غیرفعال — از ایران بلاک است و proxies.txt هم IP محلی است.
     providers = build_providers()
     proxy_pool = ProxyPool(PROXY_FILE)
     ua_mgr = UAManager(UA_FILE)
-    cache = BalanceCache(max_size=CACHE_MAX_SIZE, ttl=CACHE_TTL)
+    cache = BalanceCache(
+        max_size=CACHE_MAX_SIZE,
+        ttl=CACHE_TTL,
+        enabled=ENABLE_CACHE,
+    )
     await cache.load_from_disk()
 
     stats = Stats(providers)
@@ -887,7 +1050,6 @@ async def main():
             ]
 
             try:
-                # منتظر بمان تا یا stop_event روشن شود یا همه‌ی taskها تمام شوند
                 while not stop_event.is_set():
                     done, pending = await asyncio.wait(
                         tasks,
@@ -904,12 +1066,14 @@ async def main():
     except (KeyboardInterrupt, asyncio.CancelledError):
         stop_event.set()
 
-    # cleanup در finally اصلی اجرا می‌شود
     await cache.save_to_disk()
     save_stats(stats, cache)
     print(f"\n📁 آمار در {STATS_FILE} ذخیره شد.")
     print(f"⏱  زمان کل: {stats.elapsed:.1f}s | کلیدها: {stats.total_keys}")
-    print(f"📦 کش: {cache.hits} hit / {cache.misses} miss")
+    if cache.enabled:
+        print(f"📦 کش: {cache.hits} hit / {cache.misses} miss")
+    else:
+        print("📦 کش: غیرفعال بود")
     print("👋 پایان.")
 
 

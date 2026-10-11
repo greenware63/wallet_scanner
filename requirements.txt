@@ -4,9 +4,10 @@ curl_cffi>=0.16.0
 base58>=2.1.1
 coincurve>=21.0.0
 solders>=0.21.0
+eth-account>=0.13.0
+tonsdk>=1.0.14
 
 # Optional: enables loading API keys/config from a local .env file
-# (used by tron_scanner.py and solana_scanner.py). Falls back to OS
-# environment variables if not installed.
+# (used by tron_scanner.py, solana_scanner.py, ton_scanner.py, and ethereum_scanner.py).
+# Falls back to OS environment variables if not installed.
 python-dotenv>=1.0.0
-

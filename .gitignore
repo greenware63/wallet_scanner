@@ -23,13 +23,19 @@ env/
 scan_stats.txt
 scan_tron_stats.txt
 scan_solana_stats.txt
-tron_cache.json
+scan_ton_stats.txt
+scan_eth_stats.txt
 btc_cache.json
+tron_cache.json
 solana_cache.json
+ton_cache.json
+eth_cache.json
 
 found_wallets.txt
 found_tron_wallets.txt
 found_solana_wallets.txt
+found_ton_wallets.txt
+found_eth_wallets.txt
 proxies.txt
 user_agents.txt
 *.tmp

@@ -1,21 +1,24 @@
 # Wallet Scanner 🔐
 
-**High-performance async cryptocurrency address scanner** for Bitcoin, TRON, Solana, TON, and Ethereum with proxy rotation, TLS fingerprinting, multi-API/RPC support, and intelligent caching.
+**Async cryptocurrency address scanner** for Bitcoin, TRON, Solana, TON, and Ethereum with multi-API/RPC support, rate limiting, and optional caching.
 
 > ⚠️ **Educational Purpose Only**: This project is designed for learning and research. Ensure compliance with applicable laws and terms of service of blockchain APIs.
+
+> ⚠️ **Bitcoin key security and feasibility:** `bit_scanner.py` generates random private keys and checks their derived addresses against public APIs. If it finds a nonzero balance, it writes the private key in plaintext to `found_wallets.txt`. Treat that file as highly sensitive. A uniformly random 256-bit key is astronomically unlikely to match a funded wallet; this is not a practical way to find or recover wallets. For monitoring, use addresses you own and a purpose-built public-address checker.
 
 ---
 
 ## Features
 
 ### Bitcoin Scanner (`bit_scanner.py`)
-- 🚀 **Async I/O** with `curl_cffi` for TLS/JA3 fingerprint spoofing
-- 🌐 **Multiple reliable APIs**: mempool.space, blockstream.info, mempool.ninja, mempool.emzy.de, bitaps
-- 📦 **Two-tier LRU cache** with disk persistence
-- 🔄 **Proxy rotation** and User-Agent rotation
+- 🚀 **Async I/O** with `curl_cffi` and per-session browser impersonation
+- 🌐 **Multi-provider fallback** across nine public Bitcoin APIs
+- 📦 **Optional in-memory LRU cache** with disk persistence (disabled by default)
+- 🔄 **Optional proxy rotation** via `proxies.txt`
 - ⚡ **Worker Pool** (8 concurrent workers) with graceful shutdown
-- 🎯 **Token Bucket Rate Limiter** per provider
+- 🎯 **Per-provider token bucket rate limiting**, backoff, and Retry-After handling
 - 💾 **Statistics tracking** and result logging
+- 🔐 Checks Native SegWit (P2WPKH) addresses by default; Legacy and Nested SegWit are also supported
 
 ### TRON Scanner (`tron_scanner.py`)
 - 🚀 **Async I/O** with `curl_cffi` for concurrent address checking
@@ -83,7 +86,7 @@
 
 ### 1. Clone the Repository
 ```bash
-git clone https://github.com/yourusername/wallet_scanner.git
+git clone https://github.com/greenware63/wallet_scanner.git
 cd wallet_scanner
 ```
 
@@ -144,15 +147,15 @@ Edit the configuration section in `bit_scanner.py`:
 ```python
 NUM_WORKERS = 8                # Number of concurrent workers
 REQUEST_TIMEOUT = 6            # Request timeout in seconds
-MAX_RETRIES_PER_PROVIDER = 1   # Max retries per API (fail-fast)
-ENABLE_CACHE = False           # False for random scanning, True for monitoring fixed addresses
+MAX_ATTEMPTS_PER_PROVIDER = 2  # Attempts per provider before fallback
+ENABLE_CACHE = False           # Optional cache; most useful for repeated addresses
 MAX_CONCURRENT_REQUESTS = 32   # Cap on concurrent outbound HTTP requests
+MAX_SESSIONS = 64              # Maximum cached HTTP sessions
 CACHE_MAX_SIZE = 50_000        # Maximum cache entries
 CACHE_TTL = 3600               # Cache TTL in seconds (1 hour)
 CHECK_ADDRESS_TYPES = (
-    "Native SegWit (P2WPKH)",  # Uncomment more types below to also check them
-    # "Legacy (P2PKH)",
-    # "Nested SegWit (P2SH-P2WPKH)",
+    "Native SegWit (P2WPKH)",
+    # Also supported: "Legacy (P2PKH)" and "Nested SegWit (P2SH-P2WPKH)"
 )
 ```
 
@@ -160,10 +163,9 @@ CHECK_ADDRESS_TYPES = (
 - `found_wallets.txt` — Found addresses with balances
 - `scan_stats.txt` — Scan statistics
 - `btc_cache.json` — Cache data
+- `proxies.txt` — Optional proxy URLs, one per line
 
-**Input Files (Optional):**
-- `proxies.txt` — Proxy list (one per line)
-- `user_agents.txt` — Custom User-Agent list (one per line)
+Browser impersonation targets and request headers are selected internally; the scanner does not load a `user_agents.txt` file.
 
 ### TRON Scanner Configuration
 Edit the configuration section in `tron_scanner.py`:
@@ -314,7 +316,7 @@ The scanner will automatically rotate through available proxies.
 Create a `user_agents.txt` file with one User-Agent per line. The scanner will cycle through this list.
 
 ### TLS Fingerprinting
-All scanners use `curl_cffi` with `impersonate` mode to spoof browser TLS fingerprints:
+The Bitcoin scanner uses `curl_cffi` browser impersonation with a target pinned per session:
 - Chrome versions: 124, 123, 120, 116, 110
 - Edge: 101
 - Safari: 17.0, 15.5
